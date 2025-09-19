@@ -1,4 +1,4 @@
-# Gazzoz – Smart Soda Dispenser 🥤
+# Gazzoz – Smart Soda Machine 🥤⚙️
 
 Graduation project at **An-Najah National University**  
 By **Yamamah Ashayer** & **Loaa Awayes**  
@@ -62,4 +62,5 @@ All project materials (Report, Demo Video, and Presentation) are available here:
 
 ## 📜 License
 This project is for **academic and educational purposes**.
+
 
