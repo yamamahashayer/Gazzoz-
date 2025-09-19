@@ -1,0 +1,704 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <AccelStepper.h>
+#include <Stepper.h>
+#include <SoftwareSerial.h>
+
+/* ================== LCD (16x4) ================== */
+LiquidCrystal_I2C lcd(0x27, 16, 4);
+const uint8_t LCD_COLS = 16;
+
+/* ================== ESP Serial ================== */
+// RX=50 (from ESP TX), TX=51 (to ESP RX)
+SoftwareSerial espSerial(50, 51);
+
+/* ===== LCD helpers ===== */
+void lcdSetCursor16x4(uint8_t col, uint8_t row) {
+  if (col >= LCD_COLS) col = LCD_COLS - 1;
+  if (row > 3) row = 3;
+  static const uint8_t ROW_OFFSETS[4] = {0x00, 0x40, 0x10, 0x50};
+  uint8_t addr = ROW_OFFSETS[row] + col;
+  lcd.command(0x80 | addr);
+}
+void lcdHomeFix() { lcd.home(); }
+void lcdClear() { lcd.clear(); lcd.noAutoscroll(); lcd.leftToRight(); lcdHomeFix(); delay(2); }
+void lcdPrintRow(uint8_t row, const String &msg) {
+  lcdSetCursor16x4(0, row);
+  for (int i = 0; i < LCD_COLS; i++) lcd.print(' ');
+  lcdSetCursor16x4(0, row);
+  String s = msg;
+  if (s.length() > LCD_COLS) s = s.substring(0, LCD_COLS);
+  lcd.print(s);
+}
+void lcdTwo(const String &l1, const String &l2) { lcdClear(); lcdPrintRow(0,l1); lcdPrintRow(1,l2); }
+void lcdFour(const String &l1, const String &l2, const String &l3, const String &l4) {
+  lcdClear(); lcdPrintRow(0,l1); lcdPrintRow(1,l2); lcdPrintRow(2,l3); lcdPrintRow(3,l4);
+}
+
+/* === Rail Motor (S1) === */
+#define STEP_PIN 2
+#define DIR_PIN  3
+#define LIMIT_SWITCH_PIN 4
+bool railDone = false;
+
+/* === Soda plumbing (existing) === */
+// Note: Active-LOW relays
+#define VALVE_IN   41   // from cooler to bottle (IN)
+#define PUMP_IN    42   // cooler intake pump
+#define PUMP_OUT   43   // soda output pump to cup
+#define VALVE_OUT  44   // soda output valve
+
+/* === Flavor pumps — active-LOW relays === */
+#define PUMP_XL      45
+#define PUMP_ORANGE  46
+#define PUMP_SPRITE  47
+#define PUMP_COLA    48
+
+/* === S5 Motor === */
+#define IN1_S5 36
+#define IN2_S5 37
+#define IN3_S5 38
+#define IN4_S5 39
+#define EN_S5  35
+#define HALL_S5 A3
+AccelStepper stepperS5(AccelStepper::FULL4WIRE, IN1_S5, IN3_S5, IN2_S5, IN4_S5);
+bool s5Done = false;
+
+/* === S4 Motor === */
+#define IN1_S4 31
+#define IN2_S4 32
+#define IN3_S4 33
+#define IN4_S4 34
+#define EN_S4  30
+#define HALL_S4 A6
+AccelStepper stepperS4(AccelStepper::FULL4WIRE, IN1_S4, IN3_S4, IN2_S4, IN4_S4);
+bool s4Done = false;
+
+/* === Cup Dispensers === */
+const int stepsPerRevolution = 200;
+Stepper dispenser1(stepsPerRevolution, 7, 8, 9, 10);  // Large
+const int enable1 = 11;
+const int hall1  = A1;
+bool cup1Done = false;
+
+Stepper dispenser2(stepsPerRevolution, 23, 24, 25, 26); // Small
+const int enable2 = 22;
+const int hall2   = A2;
+bool cup2Done = false;
+
+/* === Drink Options / Order Menu State === */
+String cupSize = "";
+String flavor  = "";
+
+/* ======== CO2 Level selection ======== */
+enum CO2Level { CO2_MIN = 1, CO2_MED = 2, CO2_MAX = 3 };
+int co2Choice = CO2_MED;
+const char* CO2_NAMES[4] = {"", "MIN", "MED", "MAX"};
+
+/* === Level Sensors from cooler bottle === */
+// Non-contact sensors on bottle: LOW = water present (with INPUT_PULLUP)
+#define SENSOR_LOWER  29   // lower level (e.g., 250ml)
+#define SENSOR_UPPER  52   // upper level (e.g., 400ml)
+
+const unsigned long MAX_FILL_MS = 5UL * 60UL * 1000UL;  // 5 minutes
+const unsigned long PRINT_EVERY   = 1000UL;
+const uint8_t       DEBOUNCE_CNT  = 3;
+
+unsigned long startTime = 0;
+unsigned long lastPrint = 0;
+
+/* === Positions (steps) === */
+const int to_cups_large    = 0;
+const int to_cups_small    = 780;
+const int to_soda          = 2800;
+const int to_flavor_cola   = 2920;
+const int to_flavor_sprite = 3200;
+const int to_flavor_orange = 3500;
+const int to_flavor_xl     = 3740;
+const int to_delivery_position = 2100;
+
+int currentRailPosition = 0;
+
+/* === Timings === */   
+const unsigned long SODA_MS_SMALL   = 9000UL;
+const unsigned long SODA_MS_LARGE   = 18000UL;
+const unsigned long FLAVOR_MS_SMALL = 2500UL;
+const unsigned long FLAVOR_MS_LARGE = 4000UL;
+
+/* ================== Ultrasonic Cup Sensor @ DELIVERY ================== */
+const int TRIG = A8;   // TRIG pin (digital mode on analog A8)
+const int ECHO = A9;   // ECHO pin (digital mode on analog A9)
+const int CUP_DISTANCE = 10; // cm threshold for "cup present"
+
+// Single reading
+long readDistanceCM() {
+  digitalWrite(TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG, LOW);
+
+  long duration = pulseIn(ECHO, HIGH, 25000UL); // 25ms timeout (~4m)
+  if (duration == 0) return -1; // no echo
+  return duration / 58;         // convert to cm
+}
+
+// Averaged reading (5 samples)
+long readDistanceStableCM() {
+  const uint8_t N = 5;
+  long s = 0; uint8_t c = 0;
+  for (uint8_t i=0;i<N;i++){
+    long d = readDistanceCM();
+    if (d > 0) { s += d; c++; }
+    delay(25);
+  }
+  if (c == 0) return -1;
+  return s / c;
+}
+
+bool cupPresent() {
+  long d = readDistanceStableCM();
+  return (d > 0 && d <= CUP_DISTANCE);
+}
+
+// Verify cup at delivery with retries
+bool verifyCupAtDelivery(uint8_t maxTries,
+                         int cupPos,
+                         Stepper& motor, int en, int hallPin) {
+  for (uint8_t t = 1; t <= maxTries; t++) {
+    lcdFour("Checking cup", "At delivery...", "Try #" + String(t), "");
+    moveRailTo(to_delivery_position);
+    delay(300);
+
+    if (cupPresent()) {
+      lcdTwo("Cup detected ✅", "");
+      delay(200);
+      return true;
+    }
+
+    lcdFour("No cup ❌", "Re-dispensing...", "", "");
+    moveRailTo(cupPos);
+    runDispenser(motor, en, hallPin);
+    delay(300);
+  }
+
+  lcdFour("ERROR", "No cup detected", "Aborting order", "");
+  Serial.println("❌ Cup not detected after retries.");
+  return false;
+}
+
+/* ---------- helpers ---------- */
+void allFlavorPumpsOff() {
+  digitalWrite(PUMP_XL,     HIGH);
+  digitalWrite(PUMP_ORANGE, HIGH);
+  digitalWrite(PUMP_SPRITE, HIGH);
+  digitalWrite(PUMP_COLA,   HIGH);
+}
+void dispenseFlavorPin(int pin, unsigned long ms) {
+  lcdTwo("Dispensing Flavor", "Please wait...");
+  lcdPrintRow(2, "Time: " + String(ms) + " ms");
+  digitalWrite(pin, LOW);
+  delay(ms);
+  digitalWrite(pin, HIGH);
+  lcdTwo("Flavor Done", " ");
+  delay(300);
+}
+int flavorTarget() {
+  if (flavor == "SODA" || flavor == "") return -1;
+  if (flavor == "COLA")   return to_flavor_cola;
+  if (flavor == "SPRITE") return to_flavor_sprite;
+  if (flavor == "ORANGE") return to_flavor_orange;
+  if (flavor == "XL")     return to_flavor_xl;
+  return -1;
+}
+void goToFlavorStation() {
+  int target = flavorTarget();
+  if (target < 0) return;
+  lcdTwo("Go to Flavor", flavor);
+  moveRailTo(target);
+}
+
+/* ======== ORDER MENUS ======== */
+void showSizeMenu()  { lcdFour("Choose Size", "1 : Small", "2 : Large", ""); }
+void showFlavorMenu(){ lcdFour("Choose Flavor","1 SODA  2 COLA","3 SPRITE 4 ORNG","5 XL"); }
+void showCO2Menu()   { lcdFour("Bubbles Level", "1: MIN   2: MED", "3: MAX", ""); }
+
+/* ======== Order State Machine ======== */
+enum OrderState { WAIT_SIZE, WAIT_FLAVOR, WAIT_CO2, PROCESSING };
+OrderState orderState = WAIT_SIZE;
+
+int sizeChoice   = 0;
+int flavorChoice = 0;
+
+const char* FLAVORS[6] = { "", "SODA", "COLA", "SPRITE", "ORANGE", "XL" };
+
+void confirmOrderAndStart() {
+  cupSize = (sizeChoice == 2) ? "LARGE" : "SMALL";
+  flavor  = FLAVORS[flavorChoice];
+  lcdFour("Order Confirmed", cupSize, "Flavor: " + String(flavor),
+          "CO2: " + String(CO2_NAMES[co2Choice]));
+  orderState = PROCESSING;
+  prepareDrink();
+  orderState = WAIT_SIZE;
+  showSizeMenu();
+}
+
+/* ======== INPUT HANDLER (Serial + ESP) ======== */
+void handleInputStream(Stream &in) {
+  if (!in.available()) return;
+  int ch = in.read();
+  if (ch=='\r' || ch=='\n' || ch==' ') return;
+
+  if (orderState == WAIT_SIZE) {
+    if (ch == '1' || ch == '2') {
+      sizeChoice = ch - '0';
+      String s1 = (sizeChoice==2) ? "Size: LARGE" : "Size: SMALL";
+      lcdFour("Size Selected", s1, "Pick Flavor:", "See options");
+      showFlavorMenu();
+      while (in.available()) in.read();
+      orderState = WAIT_FLAVOR;
+    } else {
+      lcdTwo("Invalid Size!", "Use 1 or 2");
+      delay(900);
+      showSizeMenu();
+    }
+  }
+  else if (orderState == WAIT_FLAVOR) {
+    if (ch >= '1' && ch <= '5') {
+      flavorChoice = ch - '0';
+      lcdFour("Flavor Selected", FLAVORS[flavorChoice], "Pick CO2 level", "");
+      while (in.available()) in.read();
+      showCO2Menu();
+      orderState = WAIT_CO2;
+    } else {
+      lcdTwo("Invalid Flavor", "1..5 only");
+      delay(900);
+      showFlavorMenu();
+    }
+  }
+  else if (orderState == WAIT_CO2) {
+    if (ch >= '1' && ch <= '3') {
+      co2Choice = ch - '0'; // 1..3 => MIN/MED/MAX
+      lcdFour("CO2 Selected", String(CO2_NAMES[co2Choice]), "Confirming...", "");
+      while (in.available()) in.read();
+      confirmOrderAndStart();
+    } else {
+      lcdTwo("Invalid CO2", "Use 1..3");
+      delay(900);
+      showCO2Menu();
+    }
+  }
+}
+
+/* ======== Sensor logic (debounce + target fill) ======== */
+bool readStable(uint8_t pin) {
+  // Sensors wired as INPUT_PULLUP => LOW means water present
+  uint8_t cnt = 0;
+  for (uint8_t i = 0; i < DEBOUNCE_CNT; i++) {
+    if (digitalRead(pin) == LOW) cnt++;
+    delay(5);
+  }
+  return (cnt == DEBOUNCE_CNT);
+}
+bool lowerActive() { return readStable(SENSOR_LOWER); }
+bool upperActive() { return readStable(SENSOR_UPPER); }
+
+void relaysIn_On()  { digitalWrite(PUMP_IN, LOW);   delay(500); digitalWrite(VALVE_IN, LOW); }
+void relaysIn_Off() { digitalWrite(PUMP_IN, HIGH);  delay(500); digitalWrite(VALVE_IN, HIGH); }
+
+bool targetReached(bool targetIsUpper) {
+  return targetIsUpper ? upperActive() : lowerActive();
+}
+
+// Fill the bottle from cooler to target level (Small->LOWER, Large->UPPER)
+bool fillToTarget(bool targetIsUpper) {
+  bool lo = lowerActive();
+  bool up = upperActive();
+
+  if (!targetIsUpper) {                // Small
+    if (lo || up) return true;         // already above LOWER
+  } else {                             // Large
+    if (up) return true;               // already above UPPER
+  }
+
+  lcdTwo("Filling from", "Cooler...");
+  lcdPrintRow(2, targetIsUpper ? "Target: UPPER" : "Target: LOWER");
+  relaysIn_On();
+  startTime = millis();
+  lastPrint = startTime;
+
+  while (true) {
+    unsigned long now = millis();
+
+    if (now - lastPrint >= PRINT_EVERY) {
+      lastPrint = now;
+      unsigned long elapsed = now - startTime;
+      Serial.print("⏱️ Elapsed: "); Serial.print(elapsed/1000); Serial.println("s");
+    }
+
+    if (targetReached(targetIsUpper)) {
+      relaysIn_Off();
+      lcdTwo("Fill Complete", "Cooler → Bottle");
+      delay(300);
+      return true;
+    }
+
+    if (now - startTime >= MAX_FILL_MS) {
+      relaysIn_Off();
+      lcdTwo("Fill Timeout!", "Check sensors");
+      Serial.println("❌ ERROR: Timeout before reaching target level.");
+      return false;
+    }
+    delay(10);
+  }
+}
+
+/* ======== PROJECT LOGIC ======== */
+void setup() {
+  lcd.init(); lcd.begin(16, 4); lcd.backlight();
+  lcdFour("Welcome to", "Gazzoz", "Please wait", "");
+
+  Serial.begin(9600);     // Debug
+  espSerial.begin(9600);  // From ESP
+
+  pinMode(DIR_PIN, OUTPUT);
+  pinMode(STEP_PIN, OUTPUT);
+  pinMode(LIMIT_SWITCH_PIN, INPUT_PULLUP);
+
+  pinMode(EN_S4, OUTPUT);
+  pinMode(HALL_S4, INPUT);
+  digitalWrite(EN_S4, HIGH);
+  stepperS4.setMaxSpeed(600);
+  stepperS4.setSpeed(+200);
+
+  pinMode(EN_S5, OUTPUT);
+  pinMode(HALL_S5, INPUT);
+  digitalWrite(EN_S5, HIGH);
+  stepperS5.setMaxSpeed(600);
+  stepperS5.setSpeed(+200);
+
+  pinMode(enable1, OUTPUT);
+  pinMode(hall1, INPUT);
+  dispenser1.setSpeed(30);
+
+  pinMode(enable2, OUTPUT);
+  pinMode(hall2, INPUT);
+  dispenser2.setSpeed(30);
+
+  // Plumbing outputs
+  pinMode(VALVE_IN,  OUTPUT);
+  pinMode(VALVE_OUT, OUTPUT);
+  pinMode(PUMP_OUT,  OUTPUT);
+  pinMode(PUMP_IN,   OUTPUT);
+  digitalWrite(VALVE_IN, HIGH);
+  digitalWrite(VALVE_OUT, HIGH);
+  digitalWrite(PUMP_OUT, HIGH);
+  digitalWrite(PUMP_IN,  HIGH);
+
+  // Sensors
+  pinMode(SENSOR_LOWER, INPUT_PULLUP);
+  pinMode(SENSOR_UPPER, INPUT_PULLUP);
+
+  // Flavors off
+  pinMode(PUMP_XL,     OUTPUT);
+  pinMode(PUMP_ORANGE, OUTPUT);
+  pinMode(PUMP_SPRITE, OUTPUT);
+  pinMode(PUMP_COLA,   OUTPUT);
+  allFlavorPumpsOff();
+
+  // Ultrasonic pins
+  pinMode(TRIG, OUTPUT);
+  pinMode(ECHO, INPUT);
+}
+
+void loop() {
+  if (!railDone || !s4Done || !s5Done || !cup1Done || !cup2Done) {
+    homeAllMotors();
+    return;
+  }
+
+  static bool menusShown = false;
+  if (!menusShown) {
+    lcdFour("Welcome to", "Gazzoz", "Ready!", "");
+    delay(600);
+    showSizeMenu();
+    menusShown = true;
+  }
+
+  // Accept input from PC or ESP
+  handleInputStream(Serial);
+  handleInputStream(espSerial);
+}
+
+void prepareDrink() {
+  // 1) Cup
+  bool large = (cupSize == "LARGE");
+  if (large) {
+    Serial.println("👉 Large cup...");
+    moveRailTo(to_cups_large);
+    runDispenser(dispenser1, enable1, hall1);
+
+    // Verify at delivery before going to soda (with retries)
+    if (!verifyCupAtDelivery(3, to_cups_large, dispenser1, enable1, hall1)) return;
+  } else {
+    Serial.println("👉 Small cup...");
+    moveRailTo(to_cups_small);
+    runDispenser(dispenser2, enable2, hall2);
+
+    // Verify at delivery before going to soda (with retries)
+    if (!verifyCupAtDelivery(3, to_cups_small, dispenser2, enable2, hall2)) return;
+  }
+
+  // 2) Soda station: fill from cooler by sensors, then CO2, then pour soda
+  Serial.println("🫧 SODA station...");
+  moveRailTo(to_soda);
+  delay(300);
+
+  // Fill bottle according to cup size
+  bool wantUpper = large;
+  if (!fillToTarget(wantUpper)) {
+    Serial.println("⚠️ Aborting: fill timeout.");
+    return;
+  }
+
+  // CO₂ (S4 then S5)
+  Serial.println("🫧 CO₂ sequence...");
+  runSodaInjection();
+
+  // Pour soda into cup
+  dispenseSoda();
+  lcdTwo("Soda Done", " ");
+
+  // 3) Flavor station (if any)
+  if (flavor != "SODA") { goToFlavorStation(); }
+
+  // 4) Flavor pour (if any)
+  if (flavor != "SODA") {
+    unsigned long flavorMs = large ? FLAVOR_MS_LARGE : FLAVOR_MS_SMALL;
+    if      (flavor == "COLA")   dispenseFlavorPin(PUMP_COLA,   flavorMs);
+    else if (flavor == "SPRITE") dispenseFlavorPin(PUMP_SPRITE, flavorMs);
+    else if (flavor == "ORANGE") dispenseFlavorPin(PUMP_ORANGE, flavorMs);
+    else if (flavor == "XL")     dispenseFlavorPin(PUMP_XL,     flavorMs);
+  } else {
+    Serial.println("🧃 Pure Soda – no flavor.");
+  }
+
+  // 5) Delivery
+  Serial.println("✅ Drink Ready!");
+  moveRailTo(to_delivery_position);
+  delay(800);
+
+  allFlavorPumpsOff();
+  digitalWrite(VALVE_OUT, HIGH);
+  digitalWrite(PUMP_OUT,  HIGH);
+  
+  awaitPickupAndPark();
+  Serial.println("✅ DONE");
+}
+
+void runDispenser(Stepper& motor, int en, int hallPin) {
+  digitalWrite(en, HIGH);
+  for (int i = 0; i < 250; i++) motor.step(1);
+  digitalWrite(en, LOW);
+  Serial.println("🥤 Cup dispensed");
+  delay(300);
+}
+
+void moveRailTo(int target) {
+  Serial.print("🚂 Move Rail -> "); Serial.println(target);
+  long delta = (long)target - (long)currentRailPosition;
+  if (delta == 0) return;
+  digitalWrite(DIR_PIN, (delta > 0) ? HIGH : LOW);
+  long steps = labs(delta);
+  for (long i = 0; i < steps; i++) stepRail();
+  currentRailPosition = target;
+  delay(150);
+}
+
+/* ======== CO2 Injection: press-count depends on size & level ======== */
+int getCO2PressCount(const String& cs, int level /*1..3*/) {
+  bool large = (cs == "LARGE");
+  switch (level) {
+    case 1: return large ? 3 : 3; // MIN
+    case 2: return large ? 4 : 5; // MED
+    case 3: return large ? 5 : 7; // MAX
+    default: return large ? 4 : 3;
+  }
+}
+
+void runSodaInjection() {
+  Serial.println("🔒 Close valves before CO₂");
+  // During CO2 we don't need IN/OUT open
+  digitalWrite(VALVE_IN, HIGH);
+  digitalWrite(VALVE_OUT, HIGH);
+  allFlavorPumpsOff();
+
+  // S4
+  digitalWrite(EN_S4, HIGH);
+  stepperS4.setMaxSpeed(1200);
+  stepperS4.setAcceleration(500);
+  stepperS4.setCurrentPosition(0);
+
+  const long S4_DOWN_POS   = -1000;
+  const long S4_HALF_LIFT  = -550;
+  const int  S4_HOLD_MS    = 400;
+  const int  S4_BETWEEN_MS = 200;
+
+  int S4_PRESS_COUNT = getCO2PressCount(cupSize, co2Choice);
+
+  lcdFour("CO2 Injection", "Level: " + String(CO2_NAMES[co2Choice]),
+          "Presses: " + String(S4_PRESS_COUNT), "");
+
+  for (int i = 0; i < S4_PRESS_COUNT; i++) {
+    stepperS4.moveTo(S4_DOWN_POS);   while (stepperS4.distanceToGo()!=0) stepperS4.run();
+    delay(S4_HOLD_MS);
+    stepperS4.moveTo(S4_HALF_LIFT);  while (stepperS4.distanceToGo()!=0) stepperS4.run();
+    delay(S4_BETWEEN_MS);
+  }
+  // Home S4
+  stepperS4.setSpeed(300);
+  while (digitalRead(HALL_S4) == HIGH) stepperS4.runSpeed();
+  stepperS4.stop(); stepperS4.setCurrentPosition(0); digitalWrite(EN_S4, LOW);
+
+  // ===== S5 (two presses) =====
+  digitalWrite(EN_S5, HIGH);
+  stepperS5.setMaxSpeed(1200);
+  stepperS5.setAcceleration(500);
+  stepperS5.setCurrentPosition(0);
+
+  const long S5_DOWN_POS   = -880;
+  const int  S5_HOLD_MS    = 300;
+  const int  S5_BETWEEN_MS = 200;
+
+  for (int i = 0; i < 2; i++) {
+    stepperS5.moveTo(S5_DOWN_POS);
+    while (stepperS5.distanceToGo() != 0) stepperS5.run();
+    delay(S5_HOLD_MS);
+
+    stepperS5.moveTo(0);
+    while (stepperS5.distanceToGo() != 0) stepperS5.run();
+    delay(S5_BETWEEN_MS);
+  }
+
+  // Home S5
+  stepperS5.setSpeed(300);
+  while (digitalRead(HALL_S5) == HIGH) stepperS5.runSpeed();
+  stepperS5.stop();
+  stepperS5.setCurrentPosition(0);
+  digitalWrite(EN_S5, LOW);
+}
+
+void dispenseSoda() {
+  Serial.println("🔄 Soda Dispense...");
+  digitalWrite(VALVE_OUT, LOW);   // open
+  delay(500);
+  digitalWrite(PUMP_OUT, LOW);    // pump ON
+  unsigned long sodaMs = (cupSize == "LARGE") ? SODA_MS_LARGE : SODA_MS_SMALL;
+  delay(sodaMs);
+  digitalWrite(PUMP_OUT, HIGH);   // pump OFF
+  delay(200);
+  digitalWrite(VALVE_OUT, HIGH);  // close
+  Serial.println("✅ Soda Ready!");
+}
+
+void homeAllMotors() {
+  if (!railDone) {
+    digitalWrite(DIR_PIN, LOW);
+    if (digitalRead(LIMIT_SWITCH_PIN) == HIGH) {
+      stepRail();
+    } else {
+      railDone = true;
+      currentRailPosition = 0;
+      Serial.println("✅ Rail Homed");
+    }
+  }
+
+  if (!s4Done) {
+    if (digitalRead(HALL_S4) == HIGH) {
+      stepperS4.runSpeed();
+    } else {
+      s4Done = true;
+      stepperS4.stop(); stepperS4.setCurrentPosition(0);
+      digitalWrite(EN_S4, LOW);
+      Serial.println("✅ S4 Homed");
+    }
+  }
+
+  if (!s5Done) {
+    if (digitalRead(HALL_S5) == HIGH) {
+      stepperS5.runSpeed();
+    } else {
+      s5Done = true;
+      stepperS5.stop(); stepperS5.setCurrentPosition(0);
+      digitalWrite(EN_S5, LOW);
+      Serial.println("✅ S5 Homed");
+    }
+  }
+
+  if (!cup1Done) {
+    digitalWrite(enable1, HIGH);
+    if (digitalRead(hall1) == HIGH) {
+      dispenser1.step(-1);
+      delay(3);
+    } else {
+      cup1Done = true;
+      digitalWrite(enable1, LOW);
+      Serial.println("✅ Cup 1 Homed");
+    }
+  }
+
+  if (!cup2Done) {
+    digitalWrite(enable2, HIGH);
+    if (digitalRead(hall2) == HIGH) {
+      dispenser2.step(-1);
+      delay(3);
+    } else {
+      cup2Done = true;
+      digitalWrite(enable2, LOW);
+      Serial.println("✅ Cup 2 Homed");
+    }
+  }
+
+  if (railDone && s4Done && s5Done && cup1Done && cup2Done) {
+    lcdFour("Welcome to", "Gazzoz", "Ready!", "");
+  }
+}
+
+void awaitPickupAndPark() {
+  unsigned long t0 = millis();
+  bool seenCup = false;
+  bool blink = false;
+  unsigned long lastBlink = 0;
+
+  lcdFour("Delivery", "Take your cup 🥤", "", "Waiting...");
+
+  while (true) {
+    bool present = cupPresent();
+    if (present) seenCup = true;
+
+    if (seenCup && !present) break;
+    if (!seenCup && (millis() - t0 > 3000UL)) break;
+
+    if (millis() - lastBlink > 700UL) {
+      lastBlink = millis();
+      blink = !blink;
+      lcdFour("Delivery",
+              blink ? "Take your cup 🥤" : "                ",
+              "Waiting...", "");
+    }
+    delay(50);
+  }
+
+  lcdTwo("Cup removed ✅", "Returning Home...");
+  delay(300);
+
+  moveRailTo(0);
+  delay(200);
+}
+
+void stepRail() {
+  digitalWrite(STEP_PIN, HIGH);
+  delayMicroseconds(800);
+  digitalWrite(STEP_PIN, LOW);
+  delayMicroseconds(800);
+}
