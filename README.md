@@ -11,6 +11,12 @@ Gazzoz is a smart soda machine that automatically prepares **customizable carbon
 It integrates **Arduino Mega 2560** and **ESP32** with motors, pumps, relays, sensors, and a cooling system to provide consistent, hygienic, and flexible beverage preparation.
 
 ---
+## 📸 Prototype Image
+
+Here is the current Gazzoz smart soda dispenser prototype:
+
+![Gazzoz Prototype](https://github.com/user-attachments/assets/aab9ba85-c844-4c10-9089-be3121ac0968)
+
 
 ## 🚀 Features
 - Automatic **cup dispensing** (small / large).  
@@ -56,3 +62,4 @@ All project materials (Report, Demo Video, and Presentation) are available here:
 
 ## 📜 License
 This project is for **academic and educational purposes**.
+
